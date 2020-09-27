@@ -1,0 +1,25 @@
+[Logger]
+  # 日志输出位置
+  # 当为"consile"时，输出到控制台
+  # 否则，应提供文件路径，日志将输出到此文件中
+  Filename="console"
+  # 日志输出等级
+  # 可选：debug < info < warn < error < dpanic < panic
+  Level="debug"
+  # 日志文件轮转
+  MaxSize=1024 # 每MaxSize(MB)轮转
+  MaxAge=1     # 每MaxAge(日)轮转
+  MaxBackups=7 # 最多保留MaxBackups个日志文件
+
+[[Provider]]
+  Name="老夫"
+  URL=""
+
+[[Provider]]
+  Name="亿牛云"
+  URL=""
+
+[[Server]]
+  Bind=":9000"
+  MaxConn=3
+  Providers=["老夫", "亿牛云"]
