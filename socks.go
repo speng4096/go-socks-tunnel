@@ -1,8 +1,11 @@
 package main
 
+import "C"
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
+	"github.com/pkg/errors"
 	"go.uber.org/zap"
 	"io"
 	"log"
@@ -10,52 +13,66 @@ import (
 	"time"
 )
 
+type ConnectionStatus int8
+
 const (
-	connStatusInit    = iota // 等待客户端发出认证方法列表，随后回复选择的认证方法
-	connStatusAuth           // 等待客户端发出认证帐号密码，随后回复认证结果
-	connStatusCommand        // 等待客户端发出连接命令，随后回复连接结果(实际为连接代理服务器)
-	connStatusTran           // 等待客户端发出请求包，随后回复响应包
+	ConnectionStatusAccept  = iota // 等待客户端发出认证方法列表，随后回复选择的认证方法
+	ConnectionStatusAuth           // 等待客户端发出认证帐号密码，随后回复认证结果
+	ConnectionStatusCommand        // 等待客户端发出连接命令，随后回复连接结果(实际为连接代理服务器)
+	ConnectionStatusFlow           // 等待客户端发出请求包，随后回复响应包
+	ConnectionStatusFinish         // 连接将被关闭
 )
 
-func RunHandleSocksClient(index int, ch chan *net.TCPConn, server ServerConfig) {
-	for conn := range ch {
-		var status = connStatusInit
-		var buffer [1024]byte
-		var response []byte
-		var isCloseConn = false
-		var client net.Conn
-		var n int
-		var err error
-		logger.Info("客户进入", zap.Int("index", index), zap.String("remote", conn.RemoteAddr().String()))
-	HandleFor:
-		for {
-			if client == nil {
-				// 读取控制数据
-				conn.SetReadDeadline(time.Now().Add(time.Millisecond * time.Duration(server.TCPReadTimeout)))
-				n, err = conn.Read(buffer[:])
-				if err != nil {
-					break HandleFor
-				}
-				logger.Info("收到控制包", zap.Int("status", status), zap.ByteString("req", buffer[:n]))
-			} else {
-				// 传输流量
-				logger.Info("开始传输数据流")
-				go io.Copy(conn, client)
-				m, err := io.Copy(client, conn)
-				logger.Info("结束传输数据流", zap.Int64("m", m), zap.Error(err))
-			}
+type Connection struct {
+	ClientTCP net.Conn
+	ServerTCP net.Conn
+	Status    ConnectionStatus
+	Context   context.Context
+}
 
-		StatusSwitch:
-			switch status {
-			case connStatusInit:
+func HandleConnection(conn *Connection, c *ServerConfig) error {
+	// 避免连接处理异常造成崩溃
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Info("连接处理异常", zap.String("remote", conn.ClientTCP.RemoteAddr().String()))
+		}
+	}()
+	//
+	for {
+		var response []byte
+		var err error
+		var n int
+		var buffer [2048]byte
+
+		for {
+			// 读取隧道数据
+			if conn.Status == ConnectionStatusFlow {
+				// TODO: 对接ctx
+				logger.Info("开始传输数据", zap.String("remote", conn.ClientTCP.RemoteAddr().String()))
+				deadline := time.Now().Add(c.FlowTimeout * time.Millisecond)
+				conn.ClientTCP.SetReadDeadline(deadline)
+				conn.ServerTCP.SetReadDeadline(deadline)
+				go io.Copy(conn.ClientTCP, conn.ServerTCP)
+				io.Copy(conn.ServerTCP, conn.ClientTCP)
+				logger.Info("结束传输数据", zap.String("remote", conn.ClientTCP.RemoteAddr().String()))
+				return nil
+			}
+			// 读取握手数据
+			conn.ClientTCP.SetReadDeadline(time.Now().Add(c.TCPClientReadTimeout * time.Millisecond))
+			n, err = conn.ClientTCP.Read(buffer[:])
+			if err != nil {
+				return errors.New("读取数据失败")
+			}
+			logger.Debug("收到请求包", zap.Any("status", conn.Status), zap.ByteString("req", buffer[:n]))
+
+			// 根据状态处理握手数据
+			switch conn.Status {
+			case ConnectionStatusAccept:
 				if n < 3 {
-					conn.Close()
-					return
+					return errors.New("初始阶段数据异常")
 				}
-				// 仅支持Socks5协议
 				if buffer[0] != 5 {
-					conn.Close()
-					return
+					return errors.New("仅支持Socks5协议")
 				}
 				// 客户端支持的认证方式
 				// [0]     => NO AUTHENTICATION REQUIRED = 0x00
@@ -70,65 +87,60 @@ func RunHandleSocksClient(index int, ch chan *net.TCPConn, server ServerConfig) 
 						methods[1] = true
 					}
 				}
-				logger.Info("客户支持的认证方式", zap.Bools("methods", methods[:]))
 				// 若配置了账号密码，仅支持0x02方式（帐号密码认证）
 				// 若未配置账号密码，仅支持0x00方式（无认证）
 				var method byte = 0xff
-				if server.User != "" && server.Password != "" {
+				if c.User != "" && c.Password != "" {
 					if methods[1] {
 						method = 0x02
-						status = connStatusAuth
+						conn.Status = ConnectionStatusAuth
 					}
 				} else {
 					if methods[0] {
 						method = 0x00
-						status = connStatusCommand
+						conn.Status = ConnectionStatusCommand
 					}
 				}
 				if method == 0xff {
-					isCloseConn = true
+					return errors.New("无支持的认证方式")
 				}
 				response = []byte{0x05, method}
-				logger.Info("客户完成『初始化』阶段", zap.String("remote", conn.RemoteAddr().String()))
-			case connStatusAuth:
+			case ConnectionStatusAuth:
 				if n < 5 {
-					conn.Close()
-					return
+					return errors.New("认证阶段数据异常")
 				}
 				version := buffer[0]
 				if version != 0x01 {
-					break HandleFor
+					return errors.Errorf("未支持的认证方式: %d", version)
 				}
 				ulen := buffer[1]
 				user := buffer[2 : 2+ulen]
 				plen := buffer[2+ulen]
 				password := buffer[3+ulen : 3+ulen+plen]
-				if string(user) == server.User && string(password) == server.Password {
+				if string(user) == c.User && string(password) == c.Password {
 					response = []byte{0x01, 0x00}
-					logger.Info("客户完成『认证』阶段", zap.String("remote", conn.RemoteAddr().String()))
-					status = connStatusCommand
+					logger.Info("客户已通过账密认证", zap.String("remote", conn.ClientTCP.RemoteAddr().String()), zap.ByteString("user", user))
+					conn.Status = ConnectionStatusCommand
 				} else {
 					response = []byte{0x01, 0x01}
-					logger.Info("客户密码错误", zap.String("remote", conn.RemoteAddr().String()), zap.ByteString("user", user), zap.ByteString("password", password))
-					isCloseConn = true
+					logger.Info("客户账密错误", zap.String("remote", conn.ClientTCP.RemoteAddr().String()), zap.ByteString("user", user), zap.ByteString("password", password))
+					conn.Status = ConnectionStatusFinish
 				}
-			case connStatusCommand:
+			case ConnectionStatusCommand:
 				if n < 7 {
-					conn.Close()
-					return
+					return errors.New("命令阶段数据异常")
 				}
 				version := buffer[0]
 				if version != 0x05 {
-					conn.Close()
-					return
+					return errors.New("仅支持Socks5协议")
 				}
 				// 命令类型
 				// 目前仅支持CONNECT（0x01）类型
 				command := buffer[1]
 				if command != 0x01 {
-					isCloseConn = true
+					conn.Status = ConnectionStatusFinish
 					response = []byte{0x05, 0x07, 0x00} // Command not supported
-					break StatusSwitch
+					goto Response
 				}
 				// 请求类型
 				var ip net.IP
@@ -136,89 +148,120 @@ func RunHandleSocksClient(index int, ch chan *net.TCPConn, server ServerConfig) 
 				switch buffer[3] {
 				case 0x01: // IPv4
 					if n != 10 {
-						conn.Close()
-						return
+						return errors.New("命令阶段数据异常")
 					}
 					ip = net.IPv4(buffer[4], buffer[5], buffer[6], buffer[7])
 					port = binary.BigEndian.Uint16(buffer[8:10])
 				case 0x03: // Domain
 					right := n - 2
 					if right < 4 {
-						conn.Close()
-						return
+						return errors.New("命令阶段数据异常")
 					}
 					domain := string(buffer[5:right])
 					ips, err := net.LookupIP(domain)
 					if err != nil || len(ips) == 0 {
-						isCloseConn = true
+						conn.Status = ConnectionStatusFinish
 						response = []byte{0x05, 0x04, 0x00} // Host unreachable
-						break StatusSwitch
+						goto Response
 					}
 					ip = ips[0]
 					port = binary.BigEndian.Uint16(buffer[n-2 : n])
 				default:
-					isCloseConn = true
+					conn.Status = ConnectionStatusFinish
 					response = []byte{0x05, 0x08, 0x00} // Address type not supported
-					break StatusSwitch
+					goto Response
 				}
+				// TODO: 获取可用代理，目前本机直连服务器
 				// 建立连接
 				address := fmt.Sprintf("%s:%d", ip.String(), port)
-				client, err = net.DialTimeout("tcp", address, time.Duration(server.TCPDialTimeout)*time.Millisecond)
+				conn.ServerTCP, err = net.DialTimeout("tcp", address, time.Second)
 				if err != nil {
+					conn.Status = ConnectionStatusFinish
 					response = []byte{0x05, 0x03, 0x00} // Network unreachable
-					isCloseConn = true
-					break
+				} else {
+					conn.Status = ConnectionStatusFlow
+					response = []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} // succeeded
 				}
-				response = []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} // succeeded
+			case ConnectionStatusFinish:
+				response = nil
+				goto Response
 			default:
-				logger.Info("客户状态异常", zap.String("remote", conn.RemoteAddr().String()))
-				break HandleFor
+				return errors.Errorf("连接状态异常: %d", conn.Status)
 			}
 			// 发出响应包
+		Response:
 			if response != nil {
-				logger.Info("响应", zap.ByteString("response", response))
-				conn.SetWriteDeadline(time.Now().Add(time.Millisecond * time.Duration(server.TCPWriteTimeout)))
-				_, err = conn.Write(response)
+				conn.ClientTCP.SetWriteDeadline(time.Now().Add(c.TCPClientWriteTimeout * time.Millisecond))
+				_, err = conn.ClientTCP.Write(response)
 				response = nil
 				if err != nil {
-					break HandleFor
+					return errors.Wrap(err, "发送响应包失败")
 				}
+				logger.Debug("发送响应包", zap.ByteString("response", response))
 			}
-			if isCloseConn {
-				break HandleFor
+			if conn.Status == ConnectionStatusFinish {
+				return nil
 			}
 		}
-		logger.Info("未能建立连接", zap.String("remote", conn.RemoteAddr().String()))
-		conn.Close()
+	}
+}
+
+func RunHandleConnection(ch chan *Connection, c ServerConfig) {
+	for conn := range ch {
+		logger.Info("开始处理连接", zap.String("remote", conn.ClientTCP.RemoteAddr().String()))
+		HandleConnection(conn, &c)
+		conn.ClientTCP.Close()
+		if conn.ServerTCP != nil {
+			conn.ServerTCP.Close()
+		}
+		logger.Info("结束处理连接", zap.String("remote", conn.ClientTCP.RemoteAddr().String()))
 	}
 }
 
 func MustRunSocksServer() {
-	for _, server := range config.Server {
-		addr, err := net.ResolveTCPAddr("tcp", server.Bind)
+	for _, c := range config.Server {
+		// 监听端口
+		address, err := net.ResolveTCPAddr("tcp", c.Bind)
 		if err != nil {
-			log.Panicf("监听地址解析失败: %s, %s", server.Bind, err)
+			log.Panicf("监听地址解析失败: %s, %s", c.Bind, err)
 		}
-		l, err := net.ListenTCP("tcp", addr)
+		l, err := net.ListenTCP("tcp", address)
 		if err != nil {
-			log.Panicf("监听TCP端口失败: %s, %s", server.Bind, err)
-		}
-		// 使用固定协程数处理连接
-		ch := make(chan *net.TCPConn, 1024)
-		for i := 0; i < server.MaxConn; i++ {
-			go RunHandleSocksClient(i, ch, server)
+			log.Panicf("监听TCP端口失败: %s, %s", c.Bind, err)
 		}
 
-		// 将新连接放入队列
+		// 启动处理协程
+		ch := make(chan *Connection, 0)
+		for i := 0; i < c.MaxConnections; i++ {
+			go RunHandleConnection(ch, c)
+		}
+
+		// 将新连接放入处理队列
 		go func() {
 			for {
 				client, err := l.AcceptTCP()
+				logger.Info("客户端已连接", zap.String("remote", client.RemoteAddr().String()))
 				if err != nil {
 					logger.Warn("获取客户端连接失败", zap.Error(err))
 					continue
 				}
-				ch <- client
+				ctx, _ := context.WithTimeout(context.Background(), c.FlowTimeout*time.Millisecond)
+				conn := Connection{
+					ClientTCP: client,
+					Status:    ConnectionStatusAccept,
+					Context:   ctx,
+				}
+				timer := time.NewTimer(c.WaitForHandleTimeout * time.Millisecond)
+				select {
+				case ch <- &conn:
+				case <-timer.C:
+					client.Close()
+					logger.Warn("连接等待处理超时，已被关闭", zap.String("remote", client.RemoteAddr().String()))
+				}
+				timer.Stop()
 			}
 		}()
+
+		logger.Info("Socks服务器已启动", zap.String("bind", c.Bind))
 	}
 }

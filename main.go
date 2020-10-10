@@ -7,18 +7,21 @@ import (
 	"go.uber.org/zap/zapcore"
 	"log"
 	"os"
+	"runtime"
 	"strings"
+	"time"
 )
 
 type ServerConfig struct {
-	Bind            string
-	MaxConn         int
-	Providers       []string
-	User            string
-	Password        string
-	TCPDialTimeout  int // ms
-	TCPReadTimeout  int // ms
-	TCPWriteTimeout int // ms
+	Bind                  string
+	MaxConnections        int
+	IPProviders           []string
+	User                  string
+	Password              string
+	FlowTimeout           time.Duration // ms
+	TCPClientReadTimeout  time.Duration // ms
+	TCPClientWriteTimeout time.Duration // ms
+	WaitForHandleTimeout  time.Duration // ms
 }
 
 type Config struct {
@@ -29,7 +32,7 @@ type Config struct {
 		MaxAge     int
 		MaxBackups int
 	}
-	Provider []struct {
+	IPProvider []struct {
 		Name string
 		URL  string
 	}
@@ -41,12 +44,12 @@ var configFile = flag.String("config", "config.toml", "配置文件")
 var config = Config{}
 
 func main() {
-	// 配置文件解析
+	// 配置
 	if flag.Parse(); *configFile == "" {
-		log.Panic("请提供'config'参数")
+		log.Panic("请使用'--config'指定配置文件")
 	}
 	if _, err := toml.DecodeFile(*configFile, &config); err != nil {
-		log.Panicf("读取配置文件失败: %s", err)
+		log.Panicf("读取配置文件失败, %s, %s", *configFile, err)
 	}
 
 	// 日志
@@ -60,7 +63,8 @@ func main() {
 		logger = NewRotateFileLogger(config.Logger.Filename, config.Logger.MaxSize, config.Logger.MaxAge, config.Logger.MaxBackups, level)
 	}
 
-	// 启动服务
-	go MustRunSocksServer()
+	// 启动
+	MustRunSocksServer()
+	runtime.GC()
 	<-make(chan os.Signal, 1)
 }
