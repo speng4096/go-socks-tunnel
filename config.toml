@@ -22,4 +22,19 @@
 [[Server]]
   Bind=":9000"
   MaxConn=3
+  User="speng"
+  Password="a123456"
   Providers=["老夫", "亿牛云"]
+  TCPDialTimeout=2000  # ms
+  TCPReadTimeout=2000  # ms
+  TCPWriteTimeout=6000 # ms
+
+[[Server]]
+  Bind=":9001"
+  MaxConn=3
+  User=""
+  Password=""
+  Providers=["老夫", "亿牛云"]
+  TCPDialTimeout=2000  # ms
+  TCPReadTimeout=2000  # ms
+  TCPWriteTimeout=6000 # ms

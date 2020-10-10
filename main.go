@@ -10,9 +10,18 @@ import (
 	"strings"
 )
 
-var logger *zap.Logger
-var configFile = flag.String("config", "config.toml", "配置文件")
-var config = struct {
+type ServerConfig struct {
+	Bind            string
+	MaxConn         int
+	Providers       []string
+	User            string
+	Password        string
+	TCPDialTimeout  int // ms
+	TCPReadTimeout  int // ms
+	TCPWriteTimeout int // ms
+}
+
+type Config struct {
 	Logger struct {
 		Filename   string
 		Level      string
@@ -20,15 +29,16 @@ var config = struct {
 		MaxAge     int
 		MaxBackups int
 	}
-	Server struct {
-		Bind    string
-		MaxConn int
-	}
-	Pools []struct {
-	}
 	Provider []struct {
+		Name string
+		URL  string
 	}
-}{}
+	Server []ServerConfig
+}
+
+var logger *zap.Logger
+var configFile = flag.String("config", "config.toml", "配置文件")
+var config = Config{}
 
 func main() {
 	// 配置文件解析
